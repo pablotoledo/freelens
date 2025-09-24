@@ -1,0 +1,177 @@
+name: Portable Windows Build
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - 'feature/portable-build'
+
+permissions:
+  contents: read
+
+jobs:
+  build-portable-windows:
+    name: Build Windows Portable
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    env:
+      ELECTRON_CACHE: ${{ github.workspace }}\.cache\electron
+      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}\.cache\electron-builder
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install dependencies (Windows)
+        shell: bash
+        run: choco install yq --yes --no-progress
+
+      - name: Setup pnpm
+        run: corepack enable
+
+      - name: Setup node
+        uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Disable pre post scripts for pnpm
+        shell: bash
+        run: pnpm config set enablePrePostScripts false
+
+      - name: Get Electron version
+        shell: bash
+        run: echo "electron_version=$(yq -r .importers.freelens.devDependencies.electron.version pnpm-lock.yaml | sed 's/(.*)//')" >> $GITHUB_ENV
+
+      - name: Get Electron Builder version
+        shell: bash
+        run: echo "electron_builder_version=$(yq -r .importers.freelens.devDependencies.electron-builder.version pnpm-lock.yaml | sed 's/(.*)//')" >> $GITHUB_ENV
+
+      - name: Use Electron cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ELECTRON_CACHE }}
+          key: ${{ runner.os }}-${{ matrix.arch }}-electron-${{ env.electron_version }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-electron-
+
+      - name: Use Electron Builder cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ELECTRON_BUILDER_CACHE }}
+          key: ${{ runner.os }}-${{ matrix.arch }}-electron-builder-${{ env.electron_builder_version }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-electron-builder-
+
+      - name: Install pnpm dependencies
+        id: install-pnpm
+        shell: bash
+        run: pnpm install --color=always --prefer-offline --frozen-lockfile
+        continue-on-error: true
+
+      - name: Install pnpm dependencies (retry)
+        if: steps.install-pnpm.outcome == 'failure'
+        shell: bash
+        run: pnpm install --color=always --prefer-offline --frozen-lockfile
+
+      - name: Enable downloading for all architectures (Windows arm64)
+        if: matrix.arch == 'arm64'
+        shell: bash
+        run: echo "DOWNLOAD_ALL_ARCHITECTURES=true" >> $GITHUB_ENV
+
+      - name: Build packages
+        run: pnpm --color=always --stream build
+
+      - name: Rebuild native packages for Electron (Windows arm64)
+        if: matrix.arch == 'arm64'
+        run: pnpm --color=always electron-rebuild -a ${{ matrix.arch }}
+        env:
+          npm_config_arch: ${{ matrix.arch }}
+          npm_config_target_arch: ${{ matrix.arch }}
+
+      - name: Build extra resources
+        id: build-resources
+        run: pnpm --color=always build:resources
+        env:
+          LENS_SKIP_DOWNLOAD_BINARIES: "true"
+        continue-on-error: true
+
+      - name: Build extra resources (retry)
+        id: build-resources-2
+        if: steps.build-resources.outcome == 'failure'
+        run: pnpm --color=always build:resources
+        env:
+          LENS_SKIP_DOWNLOAD_BINARIES: "true"
+        continue-on-error: true
+
+      - name: Build extra resources (retry 2)
+        if: steps.build-resources-2.outcome == 'failure'
+        run: pnpm --color=always build:resources
+        env:
+          LENS_SKIP_DOWNLOAD_BINARIES: "true"
+
+      - name: Build Electron app (Windows - portable and zip only)
+        shell: bash
+        run: |
+          pnpm --color=always build:app \
+            portable zip \
+            --${{ matrix.arch }}
+
+      - name: Normalize filenames before upload
+        shell: bash
+        run: |
+          perl << 'END'
+          chdir "freelens/dist" or die $!;
+          my %arch = (x64 => "amd64", arm64 => "arm64");
+          my $arch = $arch{$ENV{ARCH}};
+          while (<Freelens*>) {
+            my $src = $_;
+            s/ Setup /-/;
+            s/[ _]/-/g;
+            if (/\.(exe|zip)$/ && !/-(amd64|arm64)\./) {
+              s/\.(exe|zip)$/-$arch.$1/;
+            }
+            s/[.-](aarch64|arm64)/-arm64/;
+            s/[.-](amd64|x86-64)/-amd64/;
+            s/-(amd64|arm64)\.(exe|zip)$/-windows-$1.$2/;
+            my $dst = $_;
+            if ($src ne $dst) {
+              print "rename $src to $dst\n";
+              rename $src, $dst or die $!;
+            }
+          }
+          END
+        env:
+          ARCH: ${{ matrix.arch }}
+
+      - name: List files before upload
+        shell: bash
+        run: |
+          echo "=== Files in freelens/dist directory ==="
+          ls -la freelens/dist/ || echo "No dist directory found"
+          echo "=== Looking for Freelens files ==="
+          find freelens/dist -name "Freelens*" -type f 2>/dev/null || echo "No Freelens files found"
+          echo "=== File details ==="
+          for f in freelens/dist/Freelens*.* 2>/dev/null; do
+            if [ -f "$f" ]; then
+              echo "$(ls -l "$f")" "|" "$(file -b "$f" 2>/dev/null || echo 'file command not available')"
+            fi
+          done
+
+      - name: Upload portable artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: freelens-windows-${{ matrix.arch }}-portable
+          path: |
+            freelens/dist/Freelens*.exe
+            freelens/dist/Freelens*.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6
