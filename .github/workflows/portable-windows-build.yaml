@@ -1,3 +1,6 @@
+# Simplified GitHub Actions workflow for building Windows portable versions of Freelens
+# This workflow builds only portable executables and zip files for Windows (amd64 and arm64)
+# Excludes: digital signing, MSI/NSIS installers, releases, and publishing
 name: Portable Windows Build
 
 on:
